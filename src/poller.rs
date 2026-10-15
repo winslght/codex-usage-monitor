@@ -673,9 +673,25 @@ fn fetch_usage_with_fallback(token: &str) -> Result<UsageData, PollError> {
                     if merged.session.resets_at.is_none() {
                         merged.session.resets_at = fallback.session.resets_at;
                     }
+                    if !merged.session.available && fallback.session.available {
+                        merged.session.percentage = fallback.session.percentage;
+                    }
+                    merged.session.available |= fallback.session.available;
+                    merged.session.window_seconds = merged
+                        .session
+                        .window_seconds
+                        .or(fallback.session.window_seconds);
                     if merged.weekly.resets_at.is_none() {
                         merged.weekly.resets_at = fallback.weekly.resets_at;
                     }
+                    if !merged.weekly.available && fallback.weekly.available {
+                        merged.weekly.percentage = fallback.weekly.percentage;
+                    }
+                    merged.weekly.available |= fallback.weekly.available;
+                    merged.weekly.window_seconds = merged
+                        .weekly
+                        .window_seconds
+                        .or(fallback.weekly.window_seconds);
                     return Ok(merged);
                 }
             }
@@ -719,13 +735,17 @@ fn try_usage_endpoint(token: &str) -> Result<Option<UsageData>, PollError> {
     let mut data = UsageData::default();
 
     if let Some(bucket) = &response.five_hour {
+        data.session.available = true;
         data.session.percentage = bucket.utilization;
         data.session.resets_at = parse_iso8601(bucket.resets_at.as_deref());
+        data.session.window_seconds = Some(5 * 60 * 60);
     }
 
     if let Some(bucket) = &response.seven_day {
+        data.weekly.available = true;
         data.weekly.percentage = bucket.utilization;
         data.weekly.resets_at = parse_iso8601(bucket.resets_at.as_deref());
+        data.weekly.window_seconds = Some(7 * 24 * 60 * 60);
     }
 
     Ok(Some(data))
@@ -791,19 +811,31 @@ fn fetch_usage_via_messages(token: &str) -> Result<UsageData, PollError> {
 fn parse_rate_limit_headers(response: &ureq::Response) -> UsageData {
     let mut data = UsageData::default();
 
-    data.session.percentage =
-        get_header_f64(response, "anthropic-ratelimit-unified-5h-utilization") * 100.0;
     data.session.resets_at = unix_to_system_time(get_header_i64(
         response,
         "anthropic-ratelimit-unified-5h-reset",
     ));
+    if let Some(utilization) =
+        get_header_f64(response, "anthropic-ratelimit-unified-5h-utilization")
+            .filter(|value| value.is_finite() && (0.0..=1.0).contains(value))
+    {
+        data.session.available = true;
+        data.session.percentage = utilization * 100.0;
+        data.session.window_seconds = Some(5 * 60 * 60);
+    }
 
-    data.weekly.percentage =
-        get_header_f64(response, "anthropic-ratelimit-unified-7d-utilization") * 100.0;
     data.weekly.resets_at = unix_to_system_time(get_header_i64(
         response,
         "anthropic-ratelimit-unified-7d-reset",
     ));
+    if let Some(utilization) =
+        get_header_f64(response, "anthropic-ratelimit-unified-7d-utilization")
+            .filter(|value| value.is_finite() && (0.0..=1.0).contains(value))
+    {
+        data.weekly.available = true;
+        data.weekly.percentage = utilization * 100.0;
+        data.weekly.window_seconds = Some(7 * 24 * 60 * 60);
+    }
 
     let overall_reset = get_header_i64(response, "anthropic-ratelimit-unified-reset");
 
@@ -812,14 +844,43 @@ fn parse_rate_limit_headers(response: &ureq::Response) -> UsageData {
         if status == Some("rejected") {
             let claim = response.header("anthropic-ratelimit-unified-representative-claim");
             match claim {
-                Some("five_hour") => data.session.percentage = 100.0,
-                Some("seven_day") => data.weekly.percentage = 100.0,
+                Some("five_hour") => {
+                    data.session.available = true;
+                    data.session.percentage = 100.0;
+                    data.session.window_seconds = Some(5 * 60 * 60);
+                }
+                Some("seven_day") => {
+                    data.weekly.available = true;
+                    data.weekly.percentage = 100.0;
+                    data.weekly.window_seconds = Some(7 * 24 * 60 * 60);
+                }
                 _ => {}
             }
         }
 
-        if data.session.resets_at.is_none() && overall_reset.is_some() {
-            data.session.resets_at = unix_to_system_time(overall_reset);
+        if let Some(overall_reset) = overall_reset {
+            let reset = unix_to_system_time(Some(overall_reset));
+            match response.header("anthropic-ratelimit-unified-representative-claim") {
+                Some("five_hour") if data.session.available && data.session.resets_at.is_none() => {
+                    data.session.resets_at = reset;
+                }
+                Some("seven_day") if data.weekly.available && data.weekly.resets_at.is_none() => {
+                    data.weekly.resets_at = reset;
+                }
+                _ if data.session.available
+                    && !data.weekly.available
+                    && data.session.resets_at.is_none() =>
+                {
+                    data.session.resets_at = reset;
+                }
+                _ if data.weekly.available
+                    && !data.session.available
+                    && data.weekly.resets_at.is_none() =>
+                {
+                    data.weekly.resets_at = reset;
+                }
+                _ => {}
+            }
         }
     }
 
@@ -914,8 +975,10 @@ fn codex_window_kind(window: &CodexRateLimitWindow) -> Option<UsageWindowKind> {
 
 fn codex_section_from_window(window: &CodexRateLimitWindow) -> UsageSection {
     UsageSection {
+        available: true,
         percentage: window.used_percent,
         resets_at: unix_to_system_time(Some(window.reset_at)),
+        window_seconds: window.limit_window_seconds,
     }
 }
 
@@ -1094,8 +1157,10 @@ fn fetch_antigravity_quota_summary(
 fn antigravity_section_from_quota(quota: AntigravityQuotaInfo) -> Option<UsageSection> {
     let remaining = quota.remaining_fraction?.clamp(0.0, 1.0);
     Some(UsageSection {
+        available: true,
         percentage: (1.0 - remaining) * 100.0,
         resets_at: parse_iso8601(quota.reset_time.as_deref()),
+        window_seconds: None,
     })
 }
 
@@ -1104,8 +1169,10 @@ fn antigravity_section_from_summary_bucket(
 ) -> Option<UsageSection> {
     let remaining = bucket.remaining_fraction?.clamp(0.0, 1.0);
     Some(UsageSection {
+        available: true,
         percentage: (1.0 - remaining) * 100.0,
         resets_at: parse_iso8601(bucket.reset_time.as_deref()),
+        window_seconds: None,
     })
 }
 
@@ -1133,16 +1200,18 @@ fn antigravity_usage_from_summary_group(group: AntigravityQuotaSummaryGroup) -> 
     let mut has_quota = false;
 
     for bucket in group.buckets.unwrap_or_default() {
-        let Some(section) = antigravity_section_from_summary_bucket(&bucket) else {
+        let Some(mut section) = antigravity_section_from_summary_bucket(&bucket) else {
             continue;
         };
 
         match bucket.window.as_deref() {
             Some(window) if window.eq_ignore_ascii_case("5h") => {
+                section.window_seconds = Some(5 * 60 * 60);
                 data.session = section;
                 has_quota = true;
             }
             Some(window) if window.eq_ignore_ascii_case("weekly") => {
+                section.window_seconds = Some(7 * 24 * 60 * 60);
                 data.weekly = section;
                 has_quota = true;
             }
@@ -1196,11 +1265,8 @@ fn is_antigravity_display_model(model: &str) -> bool {
         || model.starts_with("imagen")
 }
 
-fn get_header_f64(response: &ureq::Response, name: &str) -> f64 {
-    response
-        .header(name)
-        .and_then(|s| s.parse::<f64>().ok())
-        .unwrap_or(0.0)
+fn get_header_f64(response: &ureq::Response, name: &str) -> Option<f64> {
+    response.header(name).and_then(|s| s.parse::<f64>().ok())
 }
 
 fn get_header_i64(response: &ureq::Response, name: &str) -> Option<i64> {
@@ -1232,7 +1298,13 @@ fn read_first_credentials() -> Option<Credentials> {
         return Some(creds);
     }
 
-    for distro in list_wsl_distros() {
+    diagnose::log("checking WSL for Claude credentials");
+    let distros = list_wsl_distros();
+    diagnose::log(format!(
+        "WSL distro enumeration finished: {} found",
+        distros.len()
+    ));
+    for distro in distros {
         if let Some(creds) = read_wsl_credentials(&distro) {
             return Some(creds);
         }
@@ -1425,6 +1497,7 @@ fn read_next_credentials_after(source: &CredentialSource) -> Option<Credentials>
 }
 
 fn list_wsl_distros() -> Vec<String> {
+    diagnose::log("enumerating WSL distributions");
     let output = match run_with_timeout(
         Command::new("wsl.exe")
             .args(["-l", "-q"])
@@ -1862,8 +1935,10 @@ mod tests {
         assert_eq!(strings.session_window, "5h");
         assert_eq!(strings.weekly_window, "7d");
         let section = UsageSection {
+            available: false,
             percentage: 30.0,
             resets_at: None,
+            window_seconds: None,
         };
         assert_eq!(
             format_line(&section, strings, true, UsageWindowKind::Session),

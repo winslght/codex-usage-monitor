@@ -28,7 +28,7 @@ It sits in your taskbar and shows how much of your Codex usage window remains wi
 - A small native widget that lives directly in the Windows taskbar
 - One system tray icon that matches the desktop app icon
 - Left-click the tray icon to toggle the taskbar widget on or off
-- Right-click options for refresh, monitored services, usage rows, quota alerts, update frequency, language, startup, widget visibility, and updates
+- Right-click options to open the standalone usage clock and configure refresh, monitored services, usage rows, quota alerts, frequency, language, startup, widget visibility, and updates
 - Multi-monitor taskbar placement, so the widget can live on the taskbar for the screen you prefer
 - Appearance options for palette, bar style, bar thickness, and text size
 - Claude and OpenAI marks for each service column, with Codex shown in green
@@ -124,6 +124,16 @@ Hovering over the tray icon shows a compact summary for all enabled services. Le
 ### Usage Display And Alerts
 
 Use the right-click **Usage display** menu to show both quota rows or only one. The app always keeps at least one row visible.
+
+### Standalone Usage Clock (Development Build)
+
+Right-click the tray icon and choose **Open Usage Clock** to open a native clock window. It shows local time, the selected provider's session quota and reset countdown, and reads the existing in-process cache. Its one-second animation makes no provider requests. Left-click the clock to switch among enabled providers; right-click toggles always-on-top. Weekly quota is shown separately in the live-source card.
+
+The clock derives a window start and red/green pace only when the provider supplies an explicit, valid window duration and the cached data is fresh. Older responses and Antigravity model-quota fallback omit pace comparison instead of guessing a window length. Claude Code retains the existing fallback behavior: when its dedicated usage endpoint is unavailable or lacks a reset time, the fallback may send a one-token Messages API request to read rate-limit headers.
+
+The clock follows the two-column dashboard from prototype commit `26aeb13`: curved window/quota tags, local clock hands and green/red pace sectors on the left; progress comparisons, quota/countdown and live-source cards on the right. Its refresh-interval selector and refresh button reuse the tray's scheduler commands. Native supersampled drawing requires no web server or WebView.
+
+For development builds, launch with `--clock-dev` to use an isolated mutex and settings directory. It opens the standalone clock and hides the taskbar widget by default, and disables startup-entry changes and self-updates so it can run beside an installed copy.
 
 Use **Quota alerts** to choose a remaining-quota threshold of 10%, 20%, or 30%. Alerts are off by default. Each provider and quota window is notified only once until its reset time changes, including across app restarts.
 

@@ -210,12 +210,16 @@ mod tests {
     fn usage(session: f64, weekly: f64) -> UsageData {
         UsageData {
             session: UsageSection {
+                available: true,
                 percentage: session,
                 resets_at: None,
+                window_seconds: None,
             },
             weekly: UsageSection {
+                available: true,
                 percentage: weekly,
                 resets_at: None,
+                window_seconds: None,
             },
         }
     }

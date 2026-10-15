@@ -327,6 +327,13 @@ impl Monitor {
     }
 }
 impl Service {
+    pub fn is_refreshing(&self) -> bool {
+        self.in_flight.is_some()
+    }
+    pub fn next_due_in(&self, now: Instant) -> Option<Duration> {
+        self.enabled
+            .then(|| self.due.saturating_duration_since(now))
+    }
     pub fn stale(&self, now: SystemTime) -> bool {
         self.error.is_some() || self.history.is_stale(now)
     }

@@ -1,5 +1,6 @@
 #![windows_subsystem = "windows"]
 
+mod clock_window;
 mod diagnose;
 mod localization;
 mod models;

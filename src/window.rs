@@ -149,6 +149,7 @@ const IDM_MODEL_CODEX: u16 = 61;
 const IDM_MODEL_ANTIGRAVITY: u16 = 62;
 const IDM_SHOW_SESSION_WINDOW: u16 = 71;
 const IDM_SHOW_WEEKLY_WINDOW: u16 = 72;
+const IDM_SHOW_CLOCK: u16 = 73;
 const IDM_ALERT_OFF: u16 = 80;
 const IDM_ALERT_10: u16 = 81;
 const IDM_ALERT_20: u16 = 82;
@@ -324,6 +325,275 @@ fn lock_state() -> MutexGuard<'static, Option<AppState>> {
     STATE.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Read-only quota view consumed by the standalone clock window. The clock
+/// intentionally observes the same Monitor cache as the taskbar UI.
+pub fn clock_enabled_providers() -> [bool; 3] {
+    let state = lock_state();
+    state.as_ref().map_or([false; 3], |state| {
+        [
+            state.show_claude_code,
+            state.show_codex,
+            state.show_antigravity,
+        ]
+    })
+}
+
+/// Forward clock controls through the same main-window commands as the tray.
+pub fn clock_refresh_command(minutes: Option<u32>) {
+    let id = match minutes {
+        None => 1,
+        Some(1) => IDM_FREQ_1MIN,
+        Some(5) => IDM_FREQ_5MIN,
+        Some(15) => IDM_FREQ_15MIN,
+        Some(60) => IDM_FREQ_1HOUR,
+        _ => return,
+    };
+    let hwnd = lock_state().as_ref().map(|s| s.hwnd);
+    if let Some(hwnd) = hwnd {
+        unsafe {
+            let _ = PostMessageW(hwnd.to_hwnd(), WM_COMMAND, WPARAM(id as usize), LPARAM(0));
+        }
+    }
+}
+
+fn clock_remaining(section: &crate::models::UsageSection) -> Option<f64> {
+    (section.available
+        && section.percentage.is_finite()
+        && (0.0..=100.0).contains(&section.percentage))
+    .then(|| 100.0 - section.percentage)
+}
+
+pub fn clock_snapshot(provider_id: usize) -> crate::clock_window::Snapshot {
+    let state = lock_state();
+    let Some(state) = state.as_ref() else {
+        return crate::clock_window::Snapshot::default();
+    };
+    let chinese = state.language == LanguageId::SimplifiedChinese;
+    let names = ["Claude Code", "Codex", "Antigravity"];
+    let provider_id = provider_id.min(2);
+    let provider_name = names[provider_id].to_string();
+    let enabled = [
+        state.show_claude_code,
+        state.show_codex,
+        state.show_antigravity,
+    ][provider_id];
+    let service = &state.monitor.services[provider_id];
+    if !enabled {
+        return crate::clock_window::Snapshot {
+            chinese,
+            provider_name,
+            status: if chinese {
+                "请先在监控服务中启用"
+            } else {
+                "Enable this provider in Monitored Services"
+            }
+            .to_string(),
+            ..Default::default()
+        };
+    }
+    let Some(data) = service.data.as_ref() else {
+        return crate::clock_window::Snapshot {
+            status: service
+                .error
+                .map(|e| {
+                    if chinese {
+                        format!("额度暂不可用：{}", e.category())
+                    } else {
+                        format!("Quota unavailable: {e:?}")
+                    }
+                })
+                .unwrap_or_default(),
+            refresh_state: if service.is_refreshing() {
+                if chinese {
+                    "正在读取额度".to_string()
+                } else {
+                    "Reading quota".to_string()
+                }
+            } else {
+                String::new()
+            },
+            chinese,
+            provider_name,
+            ..Default::default()
+        };
+    };
+    let session = &data.session;
+    let reset = session.resets_at;
+    let remaining = clock_remaining(session);
+    let starts_at = match (reset, session.window_seconds.filter(|seconds| *seconds > 0)) {
+        (Some(reset), Some(seconds)) => reset
+            .checked_sub(Duration::from_secs(seconds))
+            .and_then(crate::native_interop::system_time_to_local)
+            .map(|time| {
+                let now = crate::native_interop::system_time_to_local(SystemTime::now());
+                if now.is_some_and(|now| {
+                    (now.wYear, now.wMonth, now.wDay) == (time.wYear, time.wMonth, time.wDay)
+                }) {
+                    format!("{:02}:{:02}", time.wHour, time.wMinute)
+                } else {
+                    format!(
+                        "{:04}-{:02}-{:02} {:02}:{:02}",
+                        time.wYear, time.wMonth, time.wDay, time.wHour, time.wMinute
+                    )
+                }
+            })
+            .unwrap_or_else(|| "--".to_string()),
+        _ => "--".to_string(),
+    };
+    let ahead_of_time = (|| {
+        let now = SystemTime::now();
+        if remaining.is_none() || service.error.is_some() || service.stale(now) {
+            return None;
+        }
+        let (reset, seconds) = (reset?, session.window_seconds?);
+        if seconds == 0 {
+            return None;
+        }
+        let duration = Duration::from_secs(seconds);
+        let start = reset.checked_sub(duration)?;
+        let elapsed = now.duration_since(start).ok()?;
+        let left = reset.duration_since(now).ok()?;
+        if elapsed > duration || left > duration {
+            return None;
+        }
+        let time_remaining = left.as_secs_f64() / duration.as_secs_f64() * 100.0;
+        Some(remaining? >= time_remaining)
+    })();
+    let pace_reason = if ahead_of_time.is_none() {
+        if service.error.is_some() || service.stale(SystemTime::now()) {
+            if chinese {
+                "数据过期时暂停速度比较"
+            } else {
+                "Comparison paused for stale data"
+            }
+        } else if reset.is_none() {
+            if chinese {
+                "缺少重置时间，无法比较"
+            } else {
+                "Reset time unavailable"
+            }
+        } else if session.window_seconds.map_or(true, |seconds| seconds == 0) {
+            if chinese {
+                "窗口时长未知，无法比较"
+            } else {
+                "Window duration unavailable"
+            }
+        } else {
+            if chinese {
+                "当前窗口外，暂停速度比较"
+            } else {
+                "Outside active window"
+            }
+        }
+    } else {
+        ""
+    };
+    let weekly = clock_remaining(&data.weekly).map(|weekly_remaining| {
+        let left = data
+            .weekly
+            .resets_at
+            .and_then(|reset| reset.duration_since(SystemTime::now()).ok())
+            .map(|duration| {
+                if duration.as_secs() >= 86_400 {
+                    format!(
+                        "{}d {}h",
+                        duration.as_secs() / 86_400,
+                        duration.as_secs() % 86_400 / 3600
+                    )
+                } else {
+                    format!(
+                        "{}h {:02}m",
+                        duration.as_secs() / 3600,
+                        duration.as_secs() % 3600 / 60
+                    )
+                }
+            })
+            .unwrap_or_else(|| "--".to_string());
+        if chinese {
+            format!("每周剩余 {:.0}% · {} 后重置", weekly_remaining, left)
+        } else {
+            format!(
+                "Weekly {:.0}% remaining · resets in {}",
+                weekly_remaining, left
+            )
+        }
+    });
+    let refresh_state = if service.is_refreshing() {
+        if chinese {
+            "正在刷新额度".to_string()
+        } else {
+            "Refreshing quota".to_string()
+        }
+    } else {
+        let updated = service
+            .history
+            .last_success
+            .and_then(crate::native_interop::system_time_to_local)
+            .map(|time| format!("{:02}:{:02}", time.wHour, time.wMinute))
+            .unwrap_or_else(|| "--:--".to_string());
+        let next = service
+            .next_due_in(Instant::now())
+            .map(|delay| {
+                if delay.as_secs() >= 3600 {
+                    format!(
+                        "{}h {:02}m",
+                        delay.as_secs() / 3600,
+                        delay.as_secs() % 3600 / 60
+                    )
+                } else {
+                    format!("{}m", delay.as_secs() / 60)
+                }
+            })
+            .unwrap_or_else(|| "--".to_string());
+        if chinese {
+            format!("上次成功 {} · 下次检查 {} 后", updated, next)
+        } else {
+            format!("Last success {} · next check in {}", updated, next)
+        }
+    };
+    crate::clock_window::Snapshot {
+        available: remaining.is_some(),
+        reset_at: reset,
+        window_seconds: session.window_seconds,
+        remaining_percent: remaining.unwrap_or_default(),
+        refresh_minutes: state.poll_interval_ms / 60_000,
+        status: if session.available && remaining.is_none() {
+            if chinese {
+                "额度响应超出有效范围".to_string()
+            } else {
+                "Quota value is outside the valid range".to_string()
+            }
+        } else if session.available && reset.is_some_and(|at| at <= SystemTime::now()) {
+            if chinese {
+                "额度窗口已重置，等待新数据".to_string()
+            } else {
+                "Quota window reset; waiting for updated data".to_string()
+            }
+        } else if let Some(error) = service.error {
+            if chinese {
+                format!("刷新失败，显示缓存数据：{}", error.category())
+            } else {
+                format!("Refresh issue: {error:?}; showing cached data")
+            }
+        } else if service.stale(SystemTime::now()) {
+            if chinese {
+                "额度数据可能已过期".to_string()
+            } else {
+                "Quota data may be stale".to_string()
+            }
+        } else {
+            String::new()
+        },
+        ahead_of_time,
+        pace_reason: pace_reason.to_string(),
+        starts_at,
+        chinese,
+        provider_name,
+        weekly,
+        refresh_state,
+    }
+}
+
 const SETTINGS_DIR: &str = "CodexUsage";
 const LEGACY_SETTINGS_DIR: &str = "ClaudeCodeUsageMonitor";
 
@@ -333,11 +603,23 @@ fn appdata_path(directory: &str) -> PathBuf {
 }
 
 fn settings_path() -> PathBuf {
-    appdata_path(SETTINGS_DIR)
+    if is_clock_dev_instance() {
+        appdata_path("CodexUsageClockDev")
+    } else {
+        appdata_path(SETTINGS_DIR)
+    }
 }
 
 fn legacy_settings_path() -> PathBuf {
-    appdata_path(LEGACY_SETTINGS_DIR)
+    if is_clock_dev_instance() {
+        appdata_path("CodexUsageClockDevLegacy")
+    } else {
+        appdata_path(LEGACY_SETTINGS_DIR)
+    }
+}
+
+fn is_clock_dev_instance() -> bool {
+    std::env::args().any(|arg| arg == "--clock-dev")
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1052,6 +1334,12 @@ fn auto_update_check_due(last_update_check_unix: Option<u64>) -> bool {
 }
 
 fn schedule_auto_update_check(hwnd: HWND) {
+    if is_clock_dev_instance() {
+        unsafe {
+            let _ = KillTimer(hwnd, TIMER_UPDATE_CHECK);
+        }
+        return;
+    }
     let delay_ms = {
         let state = lock_state();
         let Some(s) = state.as_ref() else {
@@ -1873,12 +2161,17 @@ pub fn run() {
         CURRENT_DPI.store(GetDpiForSystem(), Ordering::Relaxed);
     }
     diagnose::log("window::run started");
+    let dev_instance = is_clock_dev_instance();
 
     // Single-instance guard: silently exit if another instance is running.
     // Exception: when relaunched after an explorer restart (ENV_RELAUNCH set),
     // wait for the previous instance to release the mutex, then take over.
     let is_relaunch = std::env::var(ENV_RELAUNCH).is_ok();
-    let mutex_name = native_interop::wide_str("Global\\CodexUsage");
+    let mutex_name = native_interop::wide_str(if dev_instance {
+        "Global\\CodexUsageClockDev"
+    } else {
+        "Global\\CodexUsage"
+    });
     let _mutex = unsafe {
         let handle = CreateMutexW(None, true, PCWSTR::from_raw(mutex_name.as_ptr()));
         match handle {
@@ -1910,7 +2203,9 @@ pub fn run() {
         }
     };
 
-    migrate_legacy_startup_entry();
+    if !dev_instance {
+        migrate_legacy_startup_entry();
+    }
 
     let class_name = native_interop::wide_str("CodexUsage");
 
@@ -1932,15 +2227,19 @@ pub fn run() {
         };
 
         let atom = RegisterClassExW(&wc);
+        diagnose::log(format!("main window class registered atom={atom}"));
         if atom == 0 {
             diagnose::log("RegisterClassExW returned 0");
         }
 
         let claude_code_available = poller::claude_code_credentials_available();
+        diagnose::log("provider credential discovery finished");
         let settings = load_settings(claude_code_available);
+        diagnose::log("settings loaded");
         let language_override = settings.language.as_deref().and_then(LanguageId::from_code);
         let language = localization::resolve_language(language_override);
         let install_channel = updater::current_install_channel();
+        diagnose::log("install channel resolved");
 
         // Create as layered popup (will be reparented into taskbar)
         let title = native_interop::wide_str(language.strings().window_title);
@@ -1964,6 +2263,7 @@ pub fn run() {
             None,
         )
         .unwrap();
+        diagnose::log(format!("main window created hwnd={:?}", hwnd));
 
         if !large_icon.is_invalid() {
             let _ = SendMessageW(
@@ -1981,8 +2281,6 @@ pub fn run() {
                 LPARAM(small_icon.0 as isize),
             );
         }
-
-        diagnose::log(format!("main window created hwnd={:?}", hwnd));
 
         let is_dark = theme::is_dark_mode();
         let mut embedded = false;
@@ -2044,7 +2342,7 @@ pub fn run() {
                 drag_start_mouse_x: 0,
                 drag_start_client_x: 0,
                 drag_start_offset: 0,
-                widget_visible: settings.widget_visible,
+                widget_visible: settings.widget_visible && !dev_instance,
             });
         }
 
@@ -2079,9 +2377,15 @@ pub fn run() {
         // Register system tray icon(s)
         sync_tray_icons(hwnd);
 
+        // Show the independent clock in development instances, where the
+        // taskbar widget is intentionally hidden.
+        if dev_instance {
+            crate::clock_window::show();
+        }
+
         // Position and show (only if widget_visible preference is true)
         position_at_taskbar();
-        if settings.widget_visible {
+        if settings.widget_visible && !dev_instance {
             let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
         }
         diagnose::log("window shown");
@@ -2111,7 +2415,9 @@ pub fn run() {
         let send_hwnd = SendHwnd::from_hwnd(hwnd);
         request_poll(send_hwnd, false);
 
-        schedule_auto_update_check(hwnd);
+        if !dev_instance {
+            schedule_auto_update_check(hwnd);
+        }
         let should_check_updates = {
             let state = lock_state();
             state
@@ -2119,7 +2425,7 @@ pub fn run() {
                 .map(|s| auto_update_check_due(s.last_update_check_unix))
                 .unwrap_or(false)
         };
-        if should_check_updates {
+        if should_check_updates && !dev_instance {
             begin_update_check(hwnd, false);
         }
 
@@ -2132,6 +2438,7 @@ pub fn run() {
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
+        diagnose::log("main window message loop exited");
     }
 }
 
@@ -3414,6 +3721,9 @@ unsafe extern "system" fn wnd_proc(
                     request_poll(sh, true);
                 }
                 IDM_VERSION_ACTION => {
+                    if is_clock_dev_instance() {
+                        return LRESULT(0);
+                    }
                     let (install_channel, release) = {
                         let state = lock_state();
                         match state.as_ref() {
@@ -3497,7 +3807,9 @@ unsafe extern "system" fn wnd_proc(
                     }
                 }
                 IDM_START_WITH_WINDOWS => {
-                    set_startup_enabled(!is_startup_enabled());
+                    if !is_clock_dev_instance() {
+                        set_startup_enabled(!is_startup_enabled());
+                    }
                 }
                 IDM_FREQ_1MIN | IDM_FREQ_5MIN | IDM_FREQ_15MIN | IDM_FREQ_1HOUR => {
                     let new_interval = match id {
@@ -3717,6 +4029,9 @@ unsafe extern "system" fn wnd_proc(
                 id if id == tray_icon::IDM_TOGGLE_WIDGET => {
                     toggle_widget_visibility(hwnd);
                 }
+                id if id == IDM_SHOW_CLOCK => {
+                    crate::clock_window::show();
+                }
                 _ => {}
             }
             LRESULT(0)
@@ -3734,6 +4049,7 @@ unsafe extern "system" fn wnd_proc(
             LRESULT(0)
         }
         WM_DESTROY => {
+            diagnose::log("main window destroyed");
             let watch = {
                 let mut state = lock_state();
                 state.as_mut().and_then(|s| s.recovery_watch.take())
@@ -3841,6 +4157,17 @@ fn show_context_menu(hwnd: HWND) {
             MENU_ITEM_FLAGS(0),
             1,
             PCWSTR::from_raw(refresh_str.as_ptr()),
+        );
+        let clock_label = native_interop::wide_str(if language == LanguageId::SimplifiedChinese {
+            "打开额度时钟"
+        } else {
+            "Open Usage Clock"
+        });
+        let _ = AppendMenuW(
+            menu,
+            MENU_ITEM_FLAGS(0),
+            IDM_SHOW_CLOCK as usize,
+            PCWSTR::from_raw(clock_label.as_ptr()),
         );
 
         // Update Frequency submenu
@@ -4199,7 +4526,9 @@ fn show_context_menu(hwnd: HWND) {
         let settings_menu = CreatePopupMenu().unwrap();
 
         let startup_str = native_interop::wide_str(strings.start_with_windows);
-        let startup_flags = if is_startup_enabled() {
+        let startup_flags = if is_clock_dev_instance() {
+            MF_GRAYED
+        } else if is_startup_enabled() {
             MF_CHECKED
         } else {
             MENU_ITEM_FLAGS(0)
@@ -4328,13 +4657,21 @@ fn show_context_menu(hwnd: HWND) {
 
         let _ = AppendMenuW(settings_menu, MF_SEPARATOR, 0, PCWSTR::null());
 
-        let version_label =
-            version_action_label(strings, language, install_channel, &update_status);
+        let version_label = if is_clock_dev_instance() {
+            if language == LanguageId::SimplifiedChinese {
+                "开发模式已停用更新".to_string()
+            } else {
+                "Updates disabled in development mode".to_string()
+            }
+        } else {
+            version_action_label(strings, language, install_channel, &update_status)
+        };
         let version_str = native_interop::wide_str(&version_label);
-        let version_flags = if matches!(
-            update_status,
-            UpdateStatus::Checking | UpdateStatus::Applying
-        ) {
+        let version_flags = if is_clock_dev_instance()
+            || matches!(
+                update_status,
+                UpdateStatus::Checking | UpdateStatus::Applying
+            ) {
             MF_GRAYED
         } else {
             MENU_ITEM_FLAGS(0)
@@ -5050,8 +5387,10 @@ mod tests {
         let mut notified = BTreeSet::new();
         let first_reset = UNIX_EPOCH + Duration::from_secs(2_000_000_000);
         let first = crate::models::UsageSection {
+            available: true,
             percentage: 85.0,
             resets_at: Some(first_reset),
+            window_seconds: None,
         };
 
         append_quota_alert(
@@ -5082,8 +5421,10 @@ mod tests {
         assert!(alerts[0].message.contains("仅剩 15%"));
 
         let next = crate::models::UsageSection {
+            available: true,
             percentage: 90.0,
             resets_at: Some(first_reset + Duration::from_secs(18_000)),
+            window_seconds: None,
         };
         append_quota_alert(
             &mut alerts,
