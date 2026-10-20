@@ -1,5 +1,8 @@
 #![windows_subsystem = "windows"]
 
+mod clock_material;
+mod clock_motion;
+mod clock_palette;
 mod clock_window;
 mod diagnose;
 mod localization;

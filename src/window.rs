@@ -380,6 +380,7 @@ pub fn clock_snapshot(provider_id: usize) -> crate::clock_window::Snapshot {
     let service = &state.monitor.services[provider_id];
     if !enabled {
         return crate::clock_window::Snapshot {
+            refresh_minutes: state.poll_interval_ms / 60_000,
             chinese,
             provider_name,
             status: if chinese {
@@ -393,6 +394,8 @@ pub fn clock_snapshot(provider_id: usize) -> crate::clock_window::Snapshot {
     }
     let Some(data) = service.data.as_ref() else {
         return crate::clock_window::Snapshot {
+            refresh_minutes: state.poll_interval_ms / 60_000,
+            refreshing: service.is_refreshing(),
             status: service
                 .error
                 .map(|e| {
@@ -557,6 +560,10 @@ pub fn clock_snapshot(provider_id: usize) -> crate::clock_window::Snapshot {
         window_seconds: session.window_seconds,
         remaining_percent: remaining.unwrap_or_default(),
         refresh_minutes: state.poll_interval_ms / 60_000,
+        refreshing: service.is_refreshing(),
+        updated_at: service.history.last_success,
+        pace_at: None,
+        pace_cached: false,
         status: if session.available && remaining.is_none() {
             if chinese {
                 "额度响应超出有效范围".to_string()
